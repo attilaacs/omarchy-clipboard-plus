@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.idr4n.clipboard-plus",
+  "name": "Clipboard Plus",
+  "version": "1.0.0",
+  "author": "Ivan Duran",
+  "license": "MIT",
+  "description": "Omarchy clipboard history with color swatches, filters, expanded previews, and text editing.",
+  "kinds": ["overlay"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Clipboard.qml"
+  }
+}
