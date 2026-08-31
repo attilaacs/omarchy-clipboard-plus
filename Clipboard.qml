@@ -681,6 +681,7 @@ Item {
                       opacity: row.entryType === "image" || row.entryType === "file" ? 0.72 : 1
                       elide: Text.ElideRight
                       wrapMode: Text.NoWrap
+                      textFormat: Text.PlainText
                       verticalAlignment: Text.AlignVCenter
                     }
                   }
