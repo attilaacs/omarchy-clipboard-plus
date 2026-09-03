@@ -5,6 +5,7 @@ import QtQuick
 import qs.Commons
 import qs.Ui
 import "ClipboardHistory.js" as ClipboardHistory
+import "TextTransforms.js" as TextTransforms
 
 Item {
   id: root
@@ -18,6 +19,16 @@ Item {
   property bool clearConfirmOpen: false
   property bool previewExpanded: false
   property bool editorOpen: false
+  property string editorTransformLabel: ""
+  property bool transformMenuOpen: false
+  property int transformMenuIndex: 0
+  readonly property var transformOptions: [
+    { name: "title",    label: "Title Case",    key: "T" },
+    { name: "sentence", label: "Sentence case", key: "S" },
+    { name: "upper",    label: "UPPERCASE",     key: "U" },
+    { name: "lower",    label: "lowercase",     key: "L" },
+    { name: "slug",     label: "slug-case",     key: "K" }
+  ]
   property string editorError: ""
   property string editorAcceptedText: ""
   property bool editorTextGuardActive: false
@@ -485,6 +496,7 @@ Item {
     var text = ClipboardHistory.entryText(root.history, row.historyIndex)
     root.previewExpanded = false
     root.editorError = ""
+    root.editorTransformLabel = ""
     root.editorAcceptedText = text
     root.editorOpen = true
     textEditor.text = text
@@ -493,6 +505,90 @@ Item {
       textEditor.forceActiveFocus()
       textEditor.cursorPosition = textEditor.length
     })
+  }
+
+  // Rewrite the editor buffer through a named transform. Operates on the
+  // selection when there is one, so a single word or line can be recased
+  // without touching the rest, and falls back to the whole buffer otherwise.
+  //
+  // Selection and cursor are restored afterwards: a transform that silently
+  // moved the caret to the end would make repeated keys unusable.
+  function applyTextTransform(name) {
+    if (!root.editorOpen) return
+
+    var start = textEditor.selectionStart
+    var end = textEditor.selectionEnd
+    var hasSelection = start !== end
+
+    if (hasSelection) {
+      var before = textEditor.text.substring(0, start)
+      var middle = textEditor.text.substring(start, end)
+      var after = textEditor.text.substring(end)
+      var replaced = TextTransforms.run(name, middle)
+      textEditor.text = before + replaced + after
+      textEditor.select(start, start + replaced.length)
+    } else {
+      var caret = textEditor.cursorPosition
+      textEditor.text = TextTransforms.run(name, textEditor.text)
+      textEditor.cursorPosition = Math.min(caret, textEditor.length)
+    }
+
+    root.editorTransformLabel = TextTransforms.LABELS[name] || ""
+  }
+
+  // Transform the selected entry and hand it straight to the existing
+  // paste/copy path, so the list gets the same one-key flow as the editor
+  // without opening it. finishEditing() reads textEditor.text, so setting it
+  // here reuses all of its validation, dedupe and history bookkeeping.
+  function transformSelected(name, copyOnly) {
+    var row = root.selectedRow()
+    if (!row || row.entryType === "image") return
+    if (row.entryType === "oversized") {
+      root.historyError = "Oversized clipboard text cannot be transformed"
+      return
+    }
+
+    var text = ClipboardHistory.entryText(root.history, row.historyIndex)
+    if (!text || text.trim().length === 0) return
+
+    // finishEditing() reports problems into editorError, which is only rendered
+    // inside the editor. Driven from the list there is nothing to show it, so
+    // surface anything it sets in the list footer instead.
+    root.editorError = ""
+    textEditor.text = TextTransforms.run(name, text)
+    root.finishEditing(copyOnly === true)
+    if (root.editorError) {
+      root.historyError = root.editorError
+      root.editorError = ""
+    }
+  }
+
+  // Preview of what a transform would produce, for the chooser rows.
+  function transformPreview(name) {
+    var row = root.selectedRow()
+    if (!row || row.entryType !== "text") return ""
+    var text = ClipboardHistory.entryText(root.history, row.historyIndex)
+    if (!text) return ""
+    var out = TextTransforms.run(name, text.replace(/\s+/g, " ").trim())
+    return out.length > 72 ? out.substring(0, 72) + "…" : out
+  }
+
+  function openTransformMenu() {
+    var row = root.selectedRow()
+    if (!row || row.entryType !== "text") {
+      root.historyError = "Select a text entry to transform"
+      return
+    }
+    root.transformMenuIndex = 0
+    root.transformMenuOpen = true
+  }
+
+  function closeTransformMenu() { root.transformMenuOpen = false }
+
+  function commitTransformMenu() {
+    var opt = root.transformOptions[root.transformMenuIndex]
+    root.transformMenuOpen = false
+    if (opt) root.transformSelected(opt.name, false)
   }
 
   function cancelEditedHistoryAction() {
@@ -687,7 +783,10 @@ Item {
       Item {
         id: keyCatcher
         anchors.fill: parent
-        z: root.clearConfirmOpen ? 20 : 0
+        // keyCatcher hosts the modal overlays (clear-confirm, transform chooser),
+        // so it has to rise above the list whenever one of them is showing -
+        // otherwise the entries paint straight over the panel.
+        z: (root.clearConfirmOpen || root.transformMenuOpen) ? 20 : 0
         focus: true
 
         Keys.priority: Keys.BeforeItem
@@ -697,8 +796,40 @@ Item {
             return
           }
 
+          if (root.transformMenuOpen) {
+            var tShift = (event.modifiers & Qt.ShiftModifier) !== 0
+            var tCtrl = (event.modifiers & Qt.ControlModifier) !== 0
+            if (event.key === Qt.Key_Escape) {
+              root.closeTransformMenu()
+            } else if (event.key === Qt.Key_Down || (tCtrl && event.key === Qt.Key_J)) {
+              root.transformMenuIndex = (root.transformMenuIndex + 1) % root.transformOptions.length
+            } else if (event.key === Qt.Key_Up || (tCtrl && event.key === Qt.Key_K)) {
+              root.transformMenuIndex = (root.transformMenuIndex - 1 + root.transformOptions.length)
+                % root.transformOptions.length
+            } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+              root.commitTransformMenu()
+            } else {
+              // A bare letter picks its transform outright, so the menu costs
+              // nothing once the letters are known.
+              var picked = -1
+              for (var ti = 0; ti < root.transformOptions.length; ti++)
+                if (event.text && event.text.toUpperCase() === root.transformOptions[ti].key)
+                  picked = ti
+              if (picked >= 0) {
+                root.transformMenuIndex = picked
+                root.commitTransformMenu()
+              }
+            }
+            event.accepted = true
+            return
+          }
+
           var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
           var shift = (event.modifiers & Qt.ShiftModifier) !== 0
+          var alt = (event.modifiers & Qt.AltModifier) !== 0
+
+
+          // TEMPORARY diagnostic - remove once the key path is confirmed.
 
           if (root.previewExpanded) {
             if (event.key === Qt.Key_Escape || (ctrl && event.key === Qt.Key_Space)) {
@@ -753,6 +884,18 @@ Item {
           } else if (ctrl && event.key === Qt.Key_T) {
             root.cycleTypeFilter(shift ? -1 : 1)
             event.accepted = true
+          } else if (alt && event.key === Qt.Key_T) {
+            root.openTransformMenu()
+            event.accepted = true
+          } else if (alt && event.key === Qt.Key_U) {
+            root.transformSelected("upper", false)
+            event.accepted = true
+          } else if (alt && event.key === Qt.Key_L) {
+            root.transformSelected("lower", false)
+            event.accepted = true
+          } else if (alt && event.key === Qt.Key_K) {
+            root.transformSelected("slug", false)
+            event.accepted = true
           } else if (Util.editsFilter(event, root.filterText)) {
             root.setFilter(Util.editedFilter(event, root.filterText))
             event.accepted = true
@@ -806,6 +949,115 @@ Item {
           cornerRadius: root.cornerRadius
           onCanceled: root.cancelClearHistory()
           onConfirmed: root.confirmClearHistory()
+        }
+
+        // Transform chooser. Lives inside the overlay rather than as its own
+        // layer surface, so it inherits the card's focus and theme and does not
+        // fight the shared omarchy-clipboard namespace.
+        Item {
+          id: transformMenu
+          anchors.fill: parent
+          visible: root.transformMenuOpen
+          z: 15
+
+          Rectangle {
+            anchors.fill: parent
+            color: root.scrim
+            opacity: 0.75
+          }
+
+          Rectangle {
+            anchors.centerIn: parent
+            width: Math.min(parent.width - Style.space(80), Style.space(760))
+            height: menuColumn.implicitHeight + Style.space(32)
+            // Themes may set menu.background-alpha below 1, which is fine for
+            // the card floating over a scrim but leaves this panel see-through
+            // on top of the list. Keep the theme's hue, force full opacity.
+            color: Qt.rgba(root.background.r, root.background.g, root.background.b, 1.0)
+            radius: root.cornerRadius
+            border.width: Style.normalBorderWidth
+            border.color: Util.alpha(root.border, 0.9)
+
+            Column {
+              id: menuColumn
+              anchors.centerIn: parent
+              width: parent.width - Style.space(32)
+              spacing: Style.space(6)
+
+              Text {
+                text: "Transform and paste"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.heading
+                bottomPadding: Style.space(6)
+              }
+
+              Repeater {
+                model: root.transformOptions
+
+                Rectangle {
+                  width: menuColumn.width
+                  height: Style.space(40)
+                  radius: root.cornerRadius
+                  color: index === root.transformMenuIndex
+                    ? Util.alpha(root.foreground, 0.16)
+                    : "transparent"
+
+                  Row {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.leftMargin: Style.space(10)
+                    anchors.rightMargin: Style.space(10)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(10)
+
+                    Text {
+                      width: Style.space(22)
+                      text: modelData.key
+                      color: index === root.transformMenuIndex ? root.selectedText : root.foreground
+                      opacity: index === root.transformMenuIndex ? 0.9 : 0.45
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Text {
+                      width: Style.space(150)
+                      text: modelData.label
+                      textFormat: Text.PlainText
+                      color: index === root.transformMenuIndex ? root.selectedText : root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    // Live preview of this transform against the selected entry,
+                    // so the choice is visible rather than remembered.
+                    Text {
+                      width: parent.width - Style.space(200)
+                      text: root.transformMenuOpen ? root.transformPreview(modelData.name) : ""
+                      textFormat: Text.PlainText
+                      color: index === root.transformMenuIndex ? root.selectedText : root.foreground
+                      opacity: 0.55
+                      elide: Text.ElideRight
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                  }
+                }
+              }
+
+              Text {
+                text: "↑↓ or Ctrl+J/K move  ·  Enter apply  ·  press a letter to pick  ·  Esc cancel"
+                color: root.foreground
+                opacity: 0.5
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                topPadding: Style.space(8)
+              }
+            }
+          }
         }
       }
 
@@ -1055,7 +1307,7 @@ Item {
         Text {
           width: parent.width
           height: root.footerHeight
-          text: root.historyError || "Ctrl+J/K move  ·  Ctrl+Space expand  ·  Ctrl+E edit  ·  Ctrl+1–4 filter  ·  Enter paste  ·  Shift+Enter copy"
+          text: root.historyError || "Ctrl+J/K move  ·  Ctrl+Space expand  ·  Ctrl+E edit  ·  Alt+T transform  ·  Enter paste  ·  Shift+Enter copy"
           textFormat: Text.PlainText
           color: root.foreground
           opacity: root.historyError ? 0.9 : 0.5
@@ -1204,7 +1456,9 @@ Item {
         Text {
           anchors.right: parent.right
           anchors.verticalCenter: editorTitle.verticalCenter
-          text: "Ctrl+Enter paste  ·  Ctrl+Shift+Enter or Ctrl+S copy  ·  Esc cancel"
+          text: root.editorTransformLabel
+                ? "Applied " + root.editorTransformLabel + "  ·  Ctrl+Enter paste  ·  Esc cancel"
+                : "Ctrl+T Title  ·  Ctrl+U UPPER  ·  Ctrl+L lower  ·  Ctrl+K slug  ·  Ctrl+Shift+T Sentence  ·  Ctrl+Enter paste  ·  Esc cancel"
           color: root.foreground
           opacity: 0.5
           font.family: root.fontFamily
@@ -1280,6 +1534,21 @@ Item {
                   event.accepted = true
                 } else if (ctrl && event.key === Qt.Key_S) {
                   root.finishEditing(true)
+                  event.accepted = true
+                } else if (ctrl && shift && event.key === Qt.Key_T) {
+                  root.applyTextTransform("sentence")
+                  event.accepted = true
+                } else if (ctrl && event.key === Qt.Key_T) {
+                  root.applyTextTransform("title")
+                  event.accepted = true
+                } else if (ctrl && event.key === Qt.Key_U) {
+                  root.applyTextTransform("upper")
+                  event.accepted = true
+                } else if (ctrl && event.key === Qt.Key_L) {
+                  root.applyTextTransform("lower")
+                  event.accepted = true
+                } else if (ctrl && event.key === Qt.Key_K) {
+                  root.applyTextTransform("slug")
                   event.accepted = true
                 }
               }

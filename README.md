@@ -1,5 +1,9 @@
 # Clipboard Plus
 
+> **Fork note.** This fork adds a **text transform chooser** — see
+> [Text transforms](#text-transforms). Everything else is upstream
+> [idr4n/omarchy-clipboard-plus](https://github.com/idr4n/omarchy-clipboard-plus).
+
 A keyboard-first overlay for Omarchy Quattro's clipboard history, with type
 filters, large text and image previews, color swatches, and inline text
 editing.
@@ -17,6 +21,7 @@ helpers, so it does not start another `wl-paste` watcher or Quickshell process.
 - Filter all entries, text, images, or six-digit hexadecimal colors
 - Preview long text, images, and detected colors without leaving the overlay
 - Edit text before copying or pasting it
+- Transform an entry's case from a chooser: Title, Sentence, UPPER, lower, slug
 - Paste, copy, open, remove, or clear history entries from the keyboard
 - Follow the active Omarchy theme through the shell's shared UI components
 
@@ -77,6 +82,8 @@ plugin IDs remain separate; this only shares the compositor rule.
 | `Ctrl+E` | Edit the selected text entry |
 | `Ctrl+1` / `2` / `3` / `4` | Show all / text / images / colors |
 | `Ctrl+T` / `Ctrl+Shift+T` | Cycle filters forward / backward |
+| `Alt+T` | Open the transform chooser for the selected text entry |
+| `Alt+U` / `Alt+L` / `Alt+K` | Apply UPPERCASE / lowercase / slug-case directly |
 | `Ctrl+R` | Reload history from disk |
 | `Delete` | Remove the selected history entry |
 | `Shift+Delete` | Confirm clearing all history |
@@ -87,6 +94,50 @@ In the text editor:
 - `Ctrl+Enter` pastes the edited text.
 - `Ctrl+Shift+Enter` or `Ctrl+S` copies the edited text.
 - `Escape` cancels editing.
+
+## Text transforms
+
+`Alt+T` on a selected text entry opens a chooser that rewrites the text and
+pastes it, without opening the editor:
+
+| Key | Transform | `notes on the migration from xero to zoho` becomes |
+| --- | --- | --- |
+| `T` | Title Case | `Notes on the Migration from Xero to Zoho` |
+| `S` | Sentence case | `Notes on the migration from xero to zoho` |
+| `U` | UPPERCASE | `NOTES ON THE MIGRATION FROM XERO TO ZOHO` |
+| `L` | lowercase | `notes on the migration from xero to zoho` |
+| `K` | slug-case | `notes-on-the-migration-from-xero-to-zoho` |
+
+Each row previews the result against the entry you actually have selected, so
+the choice is visible rather than remembered. Navigate with the arrow keys or
+`Ctrl+J` / `Ctrl+K` and press `Enter`, or press a letter to pick outright.
+`Escape` cancels. `Alt+U`, `Alt+L` and `Alt+K` skip the chooser.
+
+The same transforms are available inside the editor (`Ctrl+E`) as `Ctrl+T`,
+`Ctrl+Shift+T`, `Ctrl+U`, `Ctrl+L` and `Ctrl+K`. There they apply to the
+selection when there is one, so a single word or line can be recased without
+touching the rest; otherwise they rewrite the whole buffer. The cursor and
+selection are preserved, so the keys can be pressed repeatedly.
+
+### Title case rules
+
+Title case follows AP style rather than naively capitalising every word:
+
+- Minor words (`a`, `of`, `the`, `from`, …) stay lowercase unless they land
+  first or last: `A Tale of Two Cities`.
+- ALL-CAPS words are treated as acronyms and survive: `Using the NASA API for a
+  SQL Query`. Input that is entirely uppercase is treated as shouting and
+  normalised instead, so `MEETING NOTES` becomes `Meeting Notes`.
+- Compounds keep the minor-word rule after the first part:
+  `state-of-the-art` becomes `State-of-the-Art`, not `State-Of-The-Art`.
+
+Slug-case folds accented Latin to ASCII (`Café Münster` becomes
+`cafe-munster`) using an explicit map rather than `String.normalize`, which is
+not guaranteed across the QML JavaScript engines this may run on.
+
+Transforms live in `TextTransforms.js`, a `.pragma library` with no Qt types
+and no shell calls, so it can be exercised outside the shell with any
+JavaScript runtime.
 
 ## Privacy and permissions
 
