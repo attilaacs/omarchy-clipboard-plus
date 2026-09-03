@@ -97,7 +97,17 @@ contain sensitive information.
 The plugin:
 
 - reads and updates `~/.local/state/omarchy/clipboard-history.json`;
-- loads image previews from file paths recorded in that history;
+- refuses raw history files over 4 MiB before JSON parsing and retains the
+  first 300 disk positions;
+- represents individual text entries over 1,048,576 code units as
+  metadata-only rows that preserve their disk indices for paste, copy, and
+  open while keeping their contents out of search, preview, and editing;
+- keeps plugin writes disabled while any oversized placeholder would remain;
+  the last one can be deleted directly, while multiple require clearing
+  history or removing them with the stock clipboard manager;
+- caps aggregate retained text at 4,194,304 code units and rejects
+  modifications that would exceed the cap instead of silently dropping entries;
+- validates persisted image-entry paths and MIME types before loading previews;
 - invokes Omarchy's packaged `omarchy-clipboard-paste-text`,
   `omarchy-clipboard-paste-file`, and `omarchy-clipboard-open` helpers;
 - stores edited text as a new stock-format history entry and invokes it by

@@ -19,11 +19,23 @@ Item {
   property bool previewExpanded: false
   property bool editorOpen: false
   property string editorError: ""
+  property string editorAcceptedText: ""
+  property bool editorTextGuardActive: false
+  property bool doubleHistoryWriteNewline: false
   property bool pendingEditedCopyOnly: false
   property bool pendingEditedAction: false
   property bool pendingEditedSave: false
-  property var pendingPreviousHistory: null
+  property bool historyWritePending: false
+  property bool historyWriteReportedSaved: false
+  property bool historyWriteFailed: false
+  property var historyWriteExpected: null
   property var history: []
+  property string historyStatus: "loading"
+  property bool historyContainsOversized: false
+  property string historyError: ""
+  property bool historyReadInFlight: false
+  property bool historyReadPending: false
+  property bool historyReadTimedOut: false
 
   property string expandedKind: ""
   property string expandedText: ""
@@ -49,12 +61,13 @@ Item {
   property int cardWidth: Math.min(Style.space(940), panel.width - Style.gapsOut * 2)
   property int cardHeight: Math.min(Style.space(640), panel.height - Style.gapsOut * 2)
   property int rowHeight: Math.max(Style.space(50), Style.font.body + Style.font.caption + Style.spacing.rowPaddingX * 2)
-  property int historyLimit: 300
+  readonly property int historyLimit: ClipboardHistory.maxHistoryEntries
   property int displayLimit: 60
 
   readonly property var typeFilters: ["all", "text", "images", "colors"]
 
   function open(payloadJson) {
+    root.cancelEditedHistoryAction()
     root.opened = true
     root.filterText = ""
     root.typeFilter = "all"
@@ -63,6 +76,8 @@ Item {
     root.previewExpanded = false
     root.editorOpen = false
     root.editorError = ""
+    root.editorAcceptedText = ""
+    textEditor.text = ""
     root.disarmPointer()
     root.rebuildDisplay()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
@@ -83,18 +98,174 @@ Item {
     else root.open("{}")
   }
 
-  function loadHistory(raw) {
-    root.history = ClipboardHistory.parseHistory(raw)
+  function applyHistoryResult(result) {
+    root.historyStatus = result.status
+    root.historyContainsOversized = !!result.containsOversized
+    root.history = result.entries
+    if (result.status !== "ok") {
+      root.cancelEditedHistoryAction()
+      root.editorOpen = false
+      root.editorError = ""
+      root.editorAcceptedText = ""
+      textEditor.text = ""
+    } else if (!root.historyContainsOversized) {
+      root.historyError = ""
+    }
     if (root.opened) root.rebuildDisplay()
   }
 
+  function resetHistoryWrite() {
+    root.historyWritePending = false
+    root.historyWriteReportedSaved = false
+    root.historyWriteFailed = false
+    root.historyWriteExpected = null
+  }
+
+  function resolveHistoryResult(result) {
+    if (!root.historyWritePending) {
+      root.applyHistoryResult(result)
+      return
+    }
+    // Quickshell 0.3.1 may report saved after an atomic commit failure.
+    // Only a bounded reread matching the expected history confirms the write.
+    var disposition = ClipboardHistory.historyWriteDisposition(
+      result,
+      root.historyWriteExpected,
+      root.historyWriteReportedSaved,
+      root.historyWriteFailed
+    )
+    if (disposition === "pending") return
+
+    var writeSucceeded = disposition === "confirmed"
+    var shouldReport = root.pendingEditedAction
+    root.resetHistoryWrite()
+
+    if (writeSucceeded) {
+      root.applyHistoryResult(result)
+      root.completeEditedHistoryAction()
+      return
+    }
+
+    root.pendingEditedSave = false
+    root.pendingEditedAction = false
+    root.pendingEditedCopyOnly = false
+    root.applyHistoryResult(result)
+    if (shouldReport && root.editorOpen)
+      root.editorError = "Could not confirm the edited clipboard text on disk"
+    else
+      root.historyError = "Could not confirm the clipboard history update on disk"
+  }
+
+  function loadHistory(raw) {
+    root.resolveHistoryResult(ClipboardHistory.parseHistory(raw))
+  }
+
+  function refuseHistory(status) {
+    root.resolveHistoryResult({ status: status, entries: [] })
+  }
+
+  function emptyHistoryText() {
+    if (root.historyStatus === "loading") return "Loading clipboard history…"
+    if (root.historyStatus === "oversized") return "Clipboard history is too large"
+    if (root.historyStatus === "unreadable") return "Clipboard history is unavailable"
+    if (root.historyStatus === "invalid") return "Clipboard history is invalid"
+    if (root.history.length === 0) return "Clipboard is empty"
+    if (!root.filterText) return "No entries for this filter"
+    return "No matches for “" + root.filterText + "”"
+  }
+
+  function scheduleHistoryReload() {
+    root.historyReadPending = true
+    historyReloadTimer.restart()
+  }
+
+  function startHistoryRead() {
+    if (root.historyReadInFlight) return
+
+    root.historyReadPending = false
+    root.historyReadTimedOut = false
+    root.historyReadInFlight = true
+    historyReadProcess.command = [
+      "head",
+      "-c",
+      String(ClipboardHistory.maxHistoryFileBytes + 1),
+      "--",
+      root.historyPath
+    ]
+    historyReadProcess.running = true
+    historyReadWatchdog.restart()
+  }
+
+  function finishHistoryRead(exitCode) {
+    if (!root.historyReadInFlight) return
+
+    historyReadWatchdog.stop()
+    root.historyReadInFlight = false
+    if (root.historyReadPending) {
+      historyReloadTimer.restart()
+      return
+    }
+
+    if (root.historyReadTimedOut || exitCode !== 0) {
+      root.refuseHistory("unreadable")
+    } else if (historyReadOutput.data.byteLength > ClipboardHistory.maxHistoryFileBytes) {
+      root.refuseHistory("oversized")
+    } else {
+      root.loadHistory(historyReadOutput.text)
+    }
+  }
+
   function saveHistory() {
-    var stored = ClipboardHistory.storageEntries(root.history, root.historyLimit)
-    historyFile.setText(JSON.stringify(stored, null, 2) + "\n")
+    if (root.historyActionBlocked()) return false
+    if (root.historyStatus !== "ok") {
+      root.historyError = "Clipboard history is unavailable; reload before modifying it"
+      return false
+    }
+
+    // With preload disabled, FileView compares against its own last write.
+    // Alternate legal JSON whitespace so an external change can always be overwritten.
+    var serialized = ClipboardHistory.serializeHistory(
+      root.history,
+      root.historyLimit,
+      root.doubleHistoryWriteNewline ? 2 : 1
+    )
+    if (serialized.status !== "ok") {
+      root.historyError = serialized.containsOversized
+        ? "History with oversized entries can only be cleared or changed in the stock manager"
+        : "Clipboard history exceeds its size limit"
+      return false
+    }
+
+    root.doubleHistoryWriteNewline = !root.doubleHistoryWriteNewline
+    root.historyError = ""
+    root.historyContainsOversized = false
+    historyFile.setText(serialized.text)
+    root.historyWriteExpected = root.history
+    root.historyWriteReportedSaved = false
+    root.historyWriteFailed = false
+    root.historyWritePending = true
+    return true
+  }
+
+  function historyActionBlocked() {
+    if (root.historyWritePending) {
+      root.historyError = "Clipboard history update is still being confirmed"
+      return true
+    }
+    if (root.historyReadPending || root.historyReadInFlight) {
+      root.historyError = "Clipboard history reload is still in progress"
+      return true
+    }
+    return false
   }
 
   function requestClearHistory() {
-    if (root.history.length === 0) return
+    if (root.historyActionBlocked()) return
+    if (root.historyStatus !== "ok"
+        && root.historyStatus !== "oversized"
+        && root.historyStatus !== "invalid")
+      return
+    if (root.history.length === 0 && root.historyStatus === "ok") return
     clearConfirm.selectedIndex = 1
     root.clearConfirmOpen = true
   }
@@ -107,7 +278,10 @@ Item {
   }
 
   function confirmClearHistory() {
+    if (root.historyActionBlocked()) return
     root.history = ClipboardHistory.clearHistory()
+    root.historyStatus = "ok"
+    root.historyContainsOversized = false
     root.saveHistory()
     root.selectedIndex = 0
     root.cursorActive = false
@@ -118,11 +292,16 @@ Item {
   }
 
   function removeDisplayIndex(index) {
+    if (root.historyActionBlocked()) return
     if (index < 0 || index >= displayModel.count) return
-
     var row = displayModel.get(index)
+
+    var previousHistory = root.history
     root.history = ClipboardHistory.removeEntryAt(root.history, row.historyIndex)
-    root.saveHistory()
+    if (!root.saveHistory()) {
+      root.history = previousHistory
+      return
+    }
 
     if (displayModel.count <= 1) {
       root.selectedIndex = 0
@@ -235,6 +414,7 @@ Item {
   }
 
   function applySelected(row) {
+    if (root.historyActionBlocked()) return
     if (!row) return
     root.opened = false
     if (row.entryType === "image") {
@@ -245,6 +425,7 @@ Item {
   }
 
   function copySelected(row) {
+    if (root.historyActionBlocked()) return
     if (!row) return
     root.opened = false
     if (row.entryType === "image") {
@@ -255,6 +436,7 @@ Item {
   }
 
   function openSelected(row) {
+    if (root.historyActionBlocked()) return
     if (!row) return
     root.opened = false
     Quickshell.execDetached([root.omarchyPath + "/bin/omarchy-clipboard-open", "--history-index", String(row.historyIndex)])
@@ -263,6 +445,10 @@ Item {
   function openExpandedPreview() {
     var row = root.selectedRow()
     if (!row) return
+    if (row.entryType === "oversized") {
+      root.historyError = "Oversized clipboard text cannot be previewed"
+      return
+    }
 
     root.expandedKind = row.swatchColor ? "color" : (row.previewImage ? "image" : "text")
     root.expandedImage = row.previewImage || ""
@@ -291,10 +477,15 @@ Item {
   function startEditor() {
     var row = root.selectedRow()
     if (!row || row.entryType === "image") return
+    if (row.entryType === "oversized") {
+      root.historyError = "Oversized clipboard text cannot be edited"
+      return
+    }
 
     var text = ClipboardHistory.entryText(root.history, row.historyIndex)
     root.previewExpanded = false
     root.editorError = ""
+    root.editorAcceptedText = text
     root.editorOpen = true
     textEditor.text = text
     editorScroll.contentY = 0
@@ -313,14 +504,28 @@ Item {
     root.cancelEditedHistoryAction()
     root.editorOpen = false
     root.editorError = ""
+    root.editorAcceptedText = ""
     textEditor.text = ""
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
   function finishEditing(copyOnly) {
+    if (root.historyActionBlocked()) {
+      root.editorError = root.historyError
+      return
+    }
+    if (root.historyStatus !== "ok") {
+      root.editorError = "Clipboard history is unavailable; press Ctrl+R before saving"
+      return
+    }
+
     var text = textEditor.text
     if (text.trim().length === 0) {
       root.editorError = "Clipboard text cannot be blank"
+      return
+    }
+    if (text.length > ClipboardHistory.maxEntryTextLength) {
+      root.editorError = "Clipboard text exceeds the 1 MiB limit"
       return
     }
     if (root.pendingEditedSave) {
@@ -333,23 +538,40 @@ Item {
       var row = { entryType: "text", historyIndex: 0 }
       root.editorOpen = false
       root.editorError = ""
+      root.editorAcceptedText = ""
       textEditor.text = ""
       if (copyOnly) root.copySelected(row)
       else root.applySelected(row)
       return
     }
 
-    root.pendingPreviousHistory = root.history
-    root.history = ClipboardHistory.addEntry(
+    var added = ClipboardHistory.addEntry(
       root.history,
       { type: "text", text: text },
       root.historyLimit
     )
+    if (added.status !== "ok") {
+      root.editorError = added.containsOversized
+        ? "History with oversized entries can only be cleared or changed in the stock manager"
+        : (added.status === "oversized"
+          ? "Clipboard history exceeds its size limit"
+          : "Clipboard history is invalid")
+      return
+    }
+
+    var previousHistory = root.history
+    root.history = added.entries
+    root.editorError = ""
+    if (!root.saveHistory()) {
+      root.history = previousHistory
+      root.rebuildDisplay()
+      root.editorError = root.historyError || "Could not save edited clipboard text"
+      return
+    }
+
     root.pendingEditedCopyOnly = copyOnly
     root.pendingEditedAction = true
     root.pendingEditedSave = true
-    root.editorError = ""
-    root.saveHistory()
   }
 
   function completeEditedHistoryAction() {
@@ -360,7 +582,6 @@ Item {
     root.pendingEditedSave = false
     root.pendingEditedAction = false
     root.pendingEditedCopyOnly = false
-    root.pendingPreviousHistory = null
     if (!shouldInvoke) return
 
     var command = [root.omarchyPath + "/bin/omarchy-clipboard-paste-text"]
@@ -374,18 +595,7 @@ Item {
     Quickshell.execDetached(command)
   }
 
-  function failEditedHistoryAction() {
-    if (!root.pendingEditedSave) return
-
-    var shouldReport = root.pendingEditedAction
-    if (root.pendingPreviousHistory) root.history = root.pendingPreviousHistory
-    root.pendingEditedSave = false
-    root.pendingEditedAction = false
-    root.pendingEditedCopyOnly = false
-    root.pendingPreviousHistory = null
-    if (root.opened) root.rebuildDisplay()
-    if (shouldReport) root.editorError = "Could not save edited clipboard text"
-  }
+  Component.onCompleted: root.scheduleHistoryReload()
 
   ListModel { id: displayModel }
 
@@ -398,13 +608,47 @@ Item {
     id: historyFile
     path: root.historyPath
     watchChanges: true
+    preload: false
     atomicWrites: true
     printErrors: false
-    onLoaded: root.loadHistory(text())
-    onLoadFailed: root.loadHistory("[]")
-    onFileChanged: reload()
-    onSaved: root.completeEditedHistoryAction()
-    onSaveFailed: root.failEditedHistoryAction()
+    onFileChanged: root.scheduleHistoryReload()
+    onSaved: {
+      if (root.historyWritePending) root.historyWriteReportedSaved = true
+      root.scheduleHistoryReload()
+    }
+    onSaveFailed: {
+      if (root.historyWritePending) root.historyWriteFailed = true
+      root.scheduleHistoryReload()
+    }
+  }
+
+  Process {
+    id: historyReadProcess
+    command: []
+    stdout: StdioCollector {
+      id: historyReadOutput
+      waitForEnd: true
+    }
+    onExited: function(exitCode, exitStatus) { root.finishHistoryRead(exitCode) }
+  }
+
+  Timer {
+    id: historyReloadTimer
+    interval: 75
+    repeat: false
+    onTriggered: root.startHistoryRead()
+  }
+
+  Timer {
+    id: historyReadWatchdog
+    interval: 5000
+    repeat: false
+    onTriggered: {
+      if (!root.historyReadInFlight) return
+      root.historyReadTimedOut = true
+      if (historyReadProcess.running) historyReadProcess.signal(9)
+      else root.finishHistoryRead(-1)
+    }
   }
 
 
@@ -492,7 +736,7 @@ Item {
             root.startEditor()
             event.accepted = true
           } else if (ctrl && event.key === Qt.Key_R) {
-            historyFile.reload()
+            root.scheduleHistoryReload()
             event.accepted = true
           } else if (ctrl && event.key === Qt.Key_1) {
             root.setTypeFilter("all")
@@ -584,6 +828,7 @@ Item {
             width: parent.width - filterLabel.width - parent.spacing
             anchors.verticalCenter: parent.verticalCenter
             text: root.filterText || "Search clipboard…"
+            textFormat: Text.PlainText
             color: root.foreground
             opacity: root.filterText ? 1 : 0.58
             font.family: root.fontFamily
@@ -664,8 +909,8 @@ Item {
                       width: visible ? parent.height : 0
                       height: parent.height
                       source: row.previewImage
-                      sourceSize.width: width
-                      sourceSize.height: height
+                      sourceSize.width: Math.max(1, root.rowHeight)
+                      sourceSize.height: Math.max(1, root.rowHeight)
                       fillMode: Image.PreserveAspectFit
                       asynchronous: true
                       smooth: true
@@ -744,6 +989,8 @@ Item {
                 anchors.fill: parent
                 anchors.leftMargin: root.contentMargin
                 source: previewPane.activeRow ? previewPane.activeRow.previewImage : ""
+                sourceSize.width: Math.max(1, root.cardWidth)
+                sourceSize.height: Math.max(1, root.cardHeight)
                 fillMode: Image.PreserveAspectFit
                 asynchronous: true
                 smooth: true
@@ -767,6 +1014,7 @@ Item {
                 Text {
                   anchors.horizontalCenter: parent.horizontalCenter
                   text: previewPane.activeRow ? previewPane.activeRow.swatchColor : ""
+                  textFormat: Text.PlainText
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.heading
@@ -792,7 +1040,8 @@ Item {
             }
 
             Text {
-              text: root.history.length === 0 ? "Clipboard is empty" : "No matches for “" + root.filterText + "”"
+              text: root.emptyHistoryText()
+              textFormat: Text.PlainText
               color: root.foreground
               opacity: 0.7
               font.family: root.fontFamily
@@ -806,9 +1055,10 @@ Item {
         Text {
           width: parent.width
           height: root.footerHeight
-          text: "Ctrl+J/K move  ·  Ctrl+Space expand  ·  Ctrl+E edit  ·  Ctrl+1–4 filter  ·  Enter paste  ·  Shift+Enter copy"
+          text: root.historyError || "Ctrl+J/K move  ·  Ctrl+Space expand  ·  Ctrl+E edit  ·  Ctrl+1–4 filter  ·  Enter paste  ·  Shift+Enter copy"
+          textFormat: Text.PlainText
           color: root.foreground
-          opacity: 0.5
+          opacity: root.historyError ? 0.9 : 0.5
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           elide: Text.ElideRight
@@ -856,6 +1106,8 @@ Item {
           anchors.top: expandedTitle.bottom
           anchors.bottom: parent.bottom
           source: root.expandedImage
+          sourceSize.width: Math.max(1, root.cardWidth)
+          sourceSize.height: Math.max(1, root.cardHeight)
           fillMode: Image.PreserveAspectFit
           asynchronous: true
           smooth: true
@@ -879,6 +1131,7 @@ Item {
           Text {
             anchors.horizontalCenter: parent.horizontalCenter
             text: root.expandedColor
+            textFormat: Text.PlainText
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.display
@@ -989,6 +1242,21 @@ Item {
               wrapMode: TextEdit.WrapAnywhere
               textFormat: TextEdit.PlainText
               selectByMouse: true
+
+              onTextChanged: {
+                if (root.editorTextGuardActive) return
+                if (text.length <= ClipboardHistory.maxEntryTextLength) {
+                  root.editorAcceptedText = text
+                  if (root.editorError === "Clipboard text exceeds the 1 MiB limit")
+                    root.editorError = ""
+                  return
+                }
+
+                root.editorTextGuardActive = true
+                text = root.editorAcceptedText
+                root.editorTextGuardActive = false
+                root.editorError = "Clipboard text exceeds the 1 MiB limit"
+              }
 
               onCursorRectangleChanged: {
                 if (cursorRectangle.y < editorScroll.contentY)
