@@ -100,13 +100,38 @@ In the text editor:
 `Alt+T` on a selected text entry opens a chooser that rewrites the text and
 pastes it, without opening the editor:
 
-| Key | Transform | `notes on the migration from xero to zoho` becomes |
-| --- | --- | --- |
-| `T` | Title Case | `Notes on the Migration from Xero to Zoho` |
-| `S` | Sentence case | `Notes on the migration from xero to zoho` |
-| `U` | UPPERCASE | `NOTES ON THE MIGRATION FROM XERO TO ZOHO` |
-| `L` | lowercase | `notes on the migration from xero to zoho` |
-| `K` | slug-case | `notes-on-the-migration-from-xero-to-zoho` |
+| Key | Transform |
+| --- | --- |
+| `T` | Title Case |
+| `S` | Sentence case |
+| `U` | UPPERCASE |
+| `L` | lowercase |
+| `K` | slug-case |
+
+Given this on the clipboard:
+
+```
+draft the release notes
+
+and a migration guide
+
+a final pass before shipping
+```
+
+Title Case gives:
+
+```
+Draft the Release Notes
+
+And a Migration Guide
+
+A Final Pass Before Shipping
+```
+
+Watch `a`: lowercase inside the second line, capitalised at the start of the
+third. The first/last-word rule applies per line rather than across the whole
+text, and blank lines and line breaks are preserved. slug-case flattens the
+same input to `draft-the-release-notes-and-a-migration-guide-a-final-pass-before-shipping`.
 
 Each row previews the result against the entry you actually have selected, so
 the choice is visible rather than remembered. Navigate with the arrow keys or

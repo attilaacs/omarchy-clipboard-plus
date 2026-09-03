@@ -43,7 +43,20 @@ function capitalize(word) {
   return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
 }
 
+// The first/last-word rule is per line, not per blob: a line beginning with a
+// minor word ("A poppy blooms") would otherwise be lowercased for sitting in
+// the middle of the text. Blank lines and line breaks are preserved.
 function title(text) {
+  if (!text) return text
+  if (text.indexOf("\n") !== -1) {
+    var lines = text.split("\n")
+    for (var li = 0; li < lines.length; li++) lines[li] = titleLine(lines[li])
+    return lines.join("\n")
+  }
+  return titleLine(text)
+}
+
+function titleLine(text) {
   if (!text) return text
 
   // A run of ALL-CAPS words is an acronym; a whole input in caps is shouting.
